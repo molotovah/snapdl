@@ -2,7 +2,7 @@
 // @name         Snapchat Image & Video Downloader (HD)
 // @name:fr      Snapchat Téléchargeur d'images et de vidéos (HD)
 // @namespace    https://github.com/Molotovah
-// @version      3.15.0
+// @version      3.15.1
 // @description  Download Snapchat images and videos in full resolution. Auto-detects split video segments and merges them into one file.
 // @description:fr Téléchargez images et vidéos Snapchat en pleine résolution. Détecte et fusionne automatiquement les vidéos découpées en plusieurs snaps.
 // @author       Molotovah (https://github.com/Molotovah)
@@ -108,7 +108,7 @@
     // is seen. Safe to call repeatedly — dedupes on blobUrl.
     const captureVideoSegment = (src) => {
         if (capturedSegments.some(s => s.blobUrl === src)) return;
-        const placeholder = { blobUrl: src, blob: null, meta: blobUrlMeta.get(src), thumb: null };
+        const placeholder = { blobUrl: src, blob: null, meta: blobUrlMeta.get(src), thumb: null, capturedAt: Date.now() };
         capturedSegments.push(placeholder);
         fetch(src).then(r => r.blob()).then(blob => {
             placeholder.blob = blob;
@@ -521,22 +521,23 @@
 
     const readySegments = () => capturedSegments.filter(s => s.blob);
 
-    // Snapchat gives no explicit "these parts are one split video" id, but
-    // split parts are all sourced from the same original message, so their
-    // resolved date (see parseDateFromCdnUrl / Last-Modified in Response.blob
-    // patch above) lands within a couple seconds of each other, while
-    // unrelated videos opened at a different scroll moment don't. Cluster
-    // consecutive (in capture order) segments whose dates are within
-    // BATCH_GAP_MS as one batch; anything without date info stays its own
-    // singleton rather than risk a false grouping.
+    // Snapchat gives no explicit "these parts are one split video" id. The
+    // server-provided date (CDN url params / Last-Modified header) looked
+    // like a proxy for it, but Last-Modified/Date aren't in the CORS-safelisted
+    // response headers, so `fetch()` can't read them on Snapchat's
+    // cross-origin CDN responses — meta.date is null in practice, and every
+    // segment ended up its own singleton. Use client-side capture time
+    // instead (see captureVideoSegment): parts of the same split video get
+    // discovered by the MutationObserver within a couple seconds of each
+    // other, while reaching an unrelated video takes deliberate scrolling.
     const BATCH_GAP_MS = 15000;
     const groupSegmentsByBatch = (segments) => {
         const groups = [];
         let current = null;
         let lastT = null;
         for (const seg of segments) {
-            const t = seg.meta && seg.meta.date ? seg.meta.date.getTime() : null;
-            if (current && t != null && lastT != null && Math.abs(t - lastT) <= BATCH_GAP_MS) {
+            const t = seg.capturedAt;
+            if (current && lastT != null && Math.abs(t - lastT) <= BATCH_GAP_MS) {
                 current.push(seg);
             } else {
                 current = [seg];

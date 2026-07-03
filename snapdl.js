@@ -1,23 +1,10 @@
 // ==UserScript==
 // @name         Snapchat Image & Video Downloader (HD)
-// @name:tr      Snapchat Resim & Video İndirici (HD)
-// @name:zh-CN   Snapchat 图片和视频下载器 (高清)
 // @name:fr      Snapchat Téléchargeur d'images et de vidéos (HD)
-// @name:ru      Snapchat Загрузчик изображений и видео (HD)
-// @name:ar      سناب شات منزل الصور والفيديوهات (HD)
-// @name:es      Snapchat Descargador de Imágenes y Videos (HD)
-// @name:pt      Snapchat Baixador de Imagens e Vídeos (HD)
-// @name:de      Snapchat Bild- & Video-Downloader (HD)
-// @name:hi      Snapchat छवि और वीडियो डाउनलोडर (HD)
-// @name:it      Snapchat Downloader di Immagini e Video (HD)
-// @name:ja      Snapchat 画像＆動画ダウンローダー (HD)
-// @name:ko      Snapchat 이미지 및 비디오 다운로더 (HD)
-// @name:bn      Snapchat ছবি এবং ভিডিও ডাউনলোডার (HD)
-// @name:id      Snapchat Pengunduh Gambar & Video (HD)
 // @namespace    https://github.com/Molotovah
 // @version      3.12.0
-// @description  Download Snapchat images and videos in full resolution. Auto-detects split video segments and merges them into one file. Supports 15+ languages.
-// @description:fr Téléchargez images et vidéos Snapchat en pleine résolution. Détecte et fusionne automatiquement les vidéos découpées en plusieurs snaps. 15+ langues.
+// @description  Download Snapchat images and videos in full resolution. Auto-detects split video segments and merges them into one file.
+// @description:fr Téléchargez images et vidéos Snapchat en pleine résolution. Détecte et fusionne automatiquement les vidéos découpées en plusieurs snaps.
 // @author       Molotovah (https://github.com/Molotovah)
 // @match        *://*.snapchat.com/*
 // @grant        none

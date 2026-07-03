@@ -2,7 +2,7 @@
 // @name         Snapchat Image & Video Downloader (HD)
 // @name:fr      Snapchat Téléchargeur d'images et de vidéos (HD)
 // @namespace    https://github.com/Molotovah
-// @version      3.13.0
+// @version      3.14.0
 // @description  Download Snapchat images and videos in full resolution. Auto-detects split video segments and merges them into one file.
 // @description:fr Téléchargez images et vidéos Snapchat en pleine résolution. Détecte et fusionne automatiquement les vidéos découpées en plusieurs snaps.
 // @author       Molotovah (https://github.com/Molotovah)
@@ -24,6 +24,16 @@
 
     const blobMeta = new WeakMap(); // Blob → { date?, sourceUrl? }
     const blobUrlMeta = new Map(); // "blob:…" → { date?, sourceUrl? }
+
+    // Snapchat's feed is virtualized: once the user scrolls past a split-video
+    // segment, its <video> gets unmounted (and often its blob: URL revoked) to
+    // free memory. Waiting until merge-click time to fetch each segment (the
+    // old approach) meant only the still-mounted segment was ever available,
+    // so "merge" silently downloaded a single segment instead. Capture each
+    // segment's Blob content the moment it's first seen, independent of DOM
+    // survival, and merge from this cache instead of re-querying the DOM.
+    const capturedSegments = []; // [{ blobUrl, blob, meta, thumb }] in first-seen order
+    const _selectedBlobUrls = new Set(); // segments the user has checked for the next merge
 
     const parseDateFromCdnUrl = (urlStr) => {
         try {
@@ -69,247 +79,151 @@
     };
 
     // ── Segment collection ────────────────────────────────────────────────────
-    // Snapchat uses opaque CDN URLs — collect all video blobs in DOM order.
-    // The floating panel lets the user merge them explicitly after scrolling
-    // through all segments to load them.
+    // Snapchat uses opaque CDN URLs. The floating panel lets the user merge
+    // segments explicitly after scrolling through all of them to load them.
 
-    const collectVideoBlobsInDomOrder = () => {
-        const result = [];
-        document.querySelectorAll('video').forEach(el => {
-            const src = el.currentSrc || el.src;
-            if (src && src.startsWith('blob:')) {
-                result.push({ blobUrl: src, el, meta: blobUrlMeta.get(src) });
-            }
-        });
-        return result;
-    };
-
-    // ── Binary helpers (Firefox Xray-safe: no TypedArray) ────────────────────
-    // Read: FileReader → atob → charCodeAt.  Write: btoa → fetch(data:) → Blob.
-
-    const readBlobBinary = (blob) => new Promise((resolve, reject) => {
-        const fr = new FileReader();
-        fr.onload = () => { try { resolve(atob(fr.result.split(',')[1])); } catch (e) { reject(e); } };
-        fr.onerror = () => reject(new Error('FileReader error'));
-        fr.readAsDataURL(blob);
+    // Grabs a single frame as a small JPEG data URL so the merge picker can
+    // show *which* video is which — segments have no other identifying label.
+    const generateThumbnail = (blob) => new Promise((resolve) => {
+        const video = document.createElement('video');
+        video.muted = true;
+        video.playsInline = true;
+        video.preload = 'metadata';
+        const url = origCreateObjectURL(blob);
+        const done = (dataUrl) => { origRevokeObjectURL(url); video.remove(); resolve(dataUrl); };
+        video.addEventListener('loadeddata', () => {
+            try {
+                const canvas = document.createElement('canvas');
+                canvas.width = 80;
+                canvas.height = Math.round(80 * ((video.videoHeight / video.videoWidth) || 0.5625));
+                canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+                done(canvas.toDataURL('image/jpeg', 0.6));
+            } catch (e) { done(null); }
+        }, { once: true });
+        video.addEventListener('error', () => done(null), { once: true });
+        video.src = url;
     });
 
-    const binaryToBlob = (binary, type) =>
-        fetch(`data:${type};base64,${btoa(binary)}`).then(r => r.blob());
-
-    // EBML VINT parser (variable-length integer used in WebM element sizes)
-    const readVint = (binary, pos) => {
-        const b = binary.charCodeAt(pos);
-        if (b & 0x80) return { value: b & 0x7F, len: 1 };
-        if (b & 0x40) return { value: ((b & 0x3F) << 8) | binary.charCodeAt(pos + 1), len: 2 };
-        if (b & 0x20) return { value: ((b & 0x1F) << 16) | (binary.charCodeAt(pos + 1) << 8) | binary.charCodeAt(pos + 2), len: 3 };
-        if (b & 0x10) return { value: ((b & 0x0F) * 0x1000000) + (binary.charCodeAt(pos + 1) << 16) + (binary.charCodeAt(pos + 2) << 8) + binary.charCodeAt(pos + 3), len: 4 };
-        return { value: 0, len: 1 };
+    // Fetches and caches a video segment's Blob the first time its blob: URL
+    // is seen. Safe to call repeatedly — dedupes on blobUrl.
+    const captureVideoSegment = (src) => {
+        if (capturedSegments.some(s => s.blobUrl === src)) return;
+        const placeholder = { blobUrl: src, blob: null, meta: blobUrlMeta.get(src), thumb: null };
+        capturedSegments.push(placeholder);
+        fetch(src).then(r => r.blob()).then(blob => {
+            placeholder.blob = blob;
+            _selectedBlobUrls.add(src); // captured segments are merge-selected by default
+            console.log('[SnapDL] Captured segment', capturedSegments.length, 'size:', blob.size);
+            updateMergePanel();
+            generateThumbnail(blob).then(thumb => { placeholder.thumb = thumb; updateMergePanel(); });
+        }).catch(e => {
+            console.warn('[SnapDL] Segment capture failed:', e.message);
+            const idx = capturedSegments.indexOf(placeholder);
+            if (idx >= 0) capturedSegments.splice(idx, 1);
+        });
     };
 
-    // ── WebM Duration field parser (pure binary string, no TypedArray/DataView) ─
-    // EBML Duration (ID 0x44 0x89) stores the value as float32 (4 bytes) or
-    // float64 (8 bytes). We decode IEEE 754 via charCodeAt — no TypedArray,
-    // no DataView, no Xray restriction.
+    // ── Merge: re-encode via canvas + MediaRecorder ───────────────────────────
+    // Real Snapchat segments turned out to be standalone, complete MP4 files
+    // (no `moof` box at all in most of them — that's why byte-level fMP4
+    // concatenation kept failing to find one), not true DASH/CMAF fragments.
+    // Byte-level splicing of independent MP4/WebM files can't produce a
+    // container that plays past the first file without a real muxer, which a
+    // userscript can't reasonably ship. Instead: play each segment through a
+    // hidden <video>, draw its frames to a <canvas>, pipe canvas + WebAudio
+    // output into one continuous MediaRecorder stream. Works regardless of
+    // source container/codec, at the cost of a real-time re-encode pass.
 
-    const readFloat64BE = (binary, pos) => {
-        const b0 = binary.charCodeAt(pos),     b1 = binary.charCodeAt(pos + 1),
-              b2 = binary.charCodeAt(pos + 2), b3 = binary.charCodeAt(pos + 3),
-              b4 = binary.charCodeAt(pos + 4), b5 = binary.charCodeAt(pos + 5),
-              b6 = binary.charCodeAt(pos + 6), b7 = binary.charCodeAt(pos + 7);
-        const sign = b0 >> 7 ? -1 : 1;
-        const exp  = ((b0 & 0x7F) << 4) | (b1 >> 4);
-        const mHi  = (b1 & 0xF) * 65536 + b2 * 256 + b3;                    // 20 bits
-        const mLo  = b4 * 16777216 + b5 * 65536 + b6 * 256 + b7;             // 32 bits
-        const mant = (mHi * 4294967296 + mLo) / 4503599627370496;            // / 2^52
-        if (exp === 2047) return (mHi || mLo) ? NaN : sign * Infinity;
-        if (exp === 0)    return sign * mant * Math.pow(2, -1022);
-        return sign * (1 + mant) * Math.pow(2, exp - 1023);
-    };
+    const reencodeSegments = (blobs, onProgress) => new Promise((resolve, reject) => {
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        const audioCtx = new AudioCtx();
+        const dest = audioCtx.createMediaStreamDestination();
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        const video = document.createElement('video');
+        video.muted = true;
+        video.playsInline = true;
+        video.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;';
+        document.body.appendChild(video);
 
-    const readFloat32BE = (binary, pos) => {
-        const b0 = binary.charCodeAt(pos),   b1 = binary.charCodeAt(pos + 1),
-              b2 = binary.charCodeAt(pos + 2), b3 = binary.charCodeAt(pos + 3);
-        const sign = b0 >> 7 ? -1 : 1;
-        const exp  = ((b0 & 0x7F) << 1) | (b1 >> 7);
-        const mant = ((b1 & 0x7F) * 65536 + b2 * 256 + b3) / 8388608;       // / 2^23
-        if (exp === 255) return (b1 & 0x7F || b2 || b3) ? NaN : sign * Infinity;
-        if (exp === 0)   return sign * mant * Math.pow(2, -126);
-        return sign * (1 + mant) * Math.pow(2, exp - 127);
-    };
+        let audioSource = null; // an element can only be wrapped by one MediaElementSourceNode, ever
+        let rafId = null;
+        let stopped = false;
 
-    const getWebMDurationMs = async (blob) => {
-        const binary = await readBlobBinary(blob.slice(0, 65536));
-        for (let i = 0; i < binary.length - 11; i++) {
-            if (binary.charCodeAt(i) !== 0x44 || binary.charCodeAt(i + 1) !== 0x89) continue;
-            const sz = binary.charCodeAt(i + 2);
-            if (sz === 0x88) { const d = readFloat64BE(binary, i + 3); if (isFinite(d) && d > 0) { console.log('[SnapDL] Duration (f64):', d, 'ms'); return Math.round(d); } }
-            if (sz === 0x84) { const d = readFloat32BE(binary, i + 3); if (isFinite(d) && d > 0) { console.log('[SnapDL] Duration (f32):', d, 'ms'); return Math.round(d); } }
-        }
-        console.warn('[SnapDL] Duration not found in WebM header');
-        return 0;
-    };
+        const cleanup = () => {
+            if (stopped) return;
+            stopped = true;
+            if (rafId) cancelAnimationFrame(rafId);
+            video.pause();
+            video.remove();
+            audioCtx.close().catch(() => {});
+        };
 
-    // ── Fix first blob: Segment element size → UNKNOWN ────────────────────────
-    // If the Segment EBML element has a fixed size, WebM parsers stop reading
-    // exactly at that byte offset and ignore all appended clusters.
-    // Setting size to UNKNOWN (0x01 FF FF FF FF FF FF FF) lets parsers continue
-    // to EOF, which is required for concatenation to work.
-
-    const ensureUnknownSegmentSize = async (blob) => {
-        // Only read first 128 bytes — Segment ID always appears within first 64 bytes
-        const hdr = await readBlobBinary(blob.slice(0, 128));
-        for (let i = 0; i < hdr.length - 12; i++) {
-            if (hdr.charCodeAt(i)     !== 0x18 || hdr.charCodeAt(i + 1) !== 0x53 ||
-                hdr.charCodeAt(i + 2) !== 0x80 || hdr.charCodeAt(i + 3) !== 0x67) continue;
-            const p = i + 4;
-            if (hdr.charCodeAt(p) !== 0x01) return blob; // not 8-byte VINT, skip
-            let already = true;
-            for (let k = 1; k < 8; k++) if (hdr.charCodeAt(p + k) !== 0xFF) { already = false; break; }
-            if (already) return blob;
-            const patchedHdr = hdr.slice(0, p) + '\x01\xFF\xFF\xFF\xFF\xFF\xFF\xFF' + hdr.slice(p + 8);
-            console.log('[SnapDL] Patched Segment size to UNKNOWN at byte', p);
-            // Reconstruct: patched 128-byte header + rest of original blob unchanged
-            return new Blob([await binaryToBlob(patchedHdr, blob.type), blob.slice(128)], { type: blob.type });
-        }
-        return blob;
-    };
-
-    // ── Append-segment preparation (strip header + patch Cluster Timecodes) ──
-    // Strips the EBML/Segment/Tracks header so only Clusters remain.
-    // Patches each Cluster's Timecode child by adding `offsetMs` so timestamps
-    // are monotonically increasing across the concatenated file.
-
-    const prepareAppendSegment = async (blob, offsetMs) => {
-        if (!(blob.type || '').includes('webm')) return blob;
-        const binary = await readBlobBinary(blob);
-
-        // Find first Cluster (0x1F 0x43 0xB6 0x75) within first 128 KB
-        let clusterStart = -1;
-        const scanEnd = Math.min(binary.length - 4, 131072);
-        for (let i = 0; i < scanEnd; i++) {
-            if (binary.charCodeAt(i) === 0x1F && binary.charCodeAt(i + 1) === 0x43 &&
-                binary.charCodeAt(i + 2) === 0xB6 && binary.charCodeAt(i + 3) === 0x75) {
-                clusterStart = i; break;
+        const drawLoop = () => {
+            if (stopped) return;
+            if (canvas.width && !video.paused && !video.ended) {
+                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
             }
-        }
-        const sliceFrom = clusterStart >= 0 ? clusterStart : 0;
-        console.log('[SnapDL] Segment cluster start:', sliceFrom, 'offset:', offsetMs, 'ms');
+            rafId = requestAnimationFrame(drawLoop);
+        };
 
-        if (offsetMs <= 0) return binaryToBlob(binary.slice(sliceFrom), blob.type);
+        const canvasStream = canvas.captureStream(30);
+        const mixedStream = new MediaStream([...canvasStream.getVideoTracks(), ...dest.stream.getAudioTracks()]);
+        const mimeType = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm']
+            .find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || 'video/webm';
+        const recorder = new MediaRecorder(mixedStream, { mimeType });
+        const chunks = [];
+        recorder.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+        recorder.onstop = () => { cleanup(); resolve(new Blob(chunks, { type: mimeType })); };
 
-        const parts = [];
-        let lastCopy = sliceFrom;
-        let pos = sliceFrom;
-
-        while (pos < binary.length - 7) {
-            if (binary.charCodeAt(pos)     !== 0x1F || binary.charCodeAt(pos + 1) !== 0x43 ||
-                binary.charCodeAt(pos + 2) !== 0xB6 || binary.charCodeAt(pos + 3) !== 0x75) { pos++; continue; }
-
-            let p = pos + 4;
-            p += readVint(binary, p).len; // skip Cluster size
-
-            if (p >= binary.length || binary.charCodeAt(p) !== 0xE7) { pos++; continue; }
-            p += 1;
-
-            const tcv = readVint(binary, p);
-            p += tcv.len;
-            const tcSize = tcv.value;
-            if (tcSize < 1 || tcSize > 6) { pos++; continue; }
-
-            let origTime = 0;
-            for (let j = 0; j < tcSize; j++) origTime = origTime * 256 + binary.charCodeAt(p + j);
-            const newTime = origTime + offsetMs;
-            let patch = '';
-            for (let j = tcSize - 1; j >= 0; j--) patch = String.fromCharCode((newTime >>> (j * 8)) & 0xFF) + patch;
-
-            parts.push(binary.slice(lastCopy, p));
-            parts.push(patch);
-            lastCopy = p + tcSize;
-            pos = p + tcSize;
-        }
-        parts.push(binary.slice(lastCopy));
-        return binaryToBlob(parts.join(''), blob.type);
-    };
-
-    // ── Fragmented MP4 (fMP4 / CMAF / DASH) concatenation ────────────────────
-    // Snapchat serves MP4 segments. Each is a self-contained fMP4 fragment:
-    //   Segment 1: [ftyp][moov][moof][mdat]   ← has init data
-    //   Segment N: [styp][sidx][moof][mdat]   ← only fragment data
-    // Keep segment 1 intact. For segments 2..N scan MP4 boxes and start from
-    // the first `moof` box (skipping ftyp/styp/sidx init boxes that would
-    // confuse parsers if duplicated). DASH timestamps in `tfdt` are absolute
-    // so no patching needed — they're already monotonically increasing.
-
-    const mergeMp4Segments = async (blobs) => {
-        const readBoxHdr = (binary, pos) => ({
-            size: binary.charCodeAt(pos) * 16777216 + binary.charCodeAt(pos + 1) * 65536 +
-                  binary.charCodeAt(pos + 2) * 256   + binary.charCodeAt(pos + 3),
-            type: binary.slice(pos + 4, pos + 8)
+        const playOne = (blob) => new Promise((res, rej) => {
+            const url = origCreateObjectURL(blob);
+            const onLoaded = () => {
+                canvas.width = video.videoWidth || canvas.width || 640;
+                canvas.height = video.videoHeight || canvas.height || 360;
+                if (!audioSource) { audioSource = audioCtx.createMediaElementSource(video); audioSource.connect(dest); }
+                video.play().catch(onError);
+            };
+            const onEnded = () => { teardown(); res(); };
+            const onError = (e) => { teardown(); rej(e instanceof Error ? e : new Error('Segment playback failed')); };
+            const teardown = () => {
+                video.removeEventListener('loadedmetadata', onLoaded);
+                video.removeEventListener('ended', onEnded);
+                video.removeEventListener('error', onError);
+                origRevokeObjectURL(url);
+            };
+            video.addEventListener('loadedmetadata', onLoaded, { once: true });
+            video.addEventListener('ended', onEnded, { once: true });
+            video.addEventListener('error', onError, { once: true });
+            video.src = url;
+            video.load();
         });
 
-        const parts = [];
-        for (let i = 0; i < blobs.length; i++) {
-            const binary = await readBlobBinary(blobs[i]);
-            if (i === 0) {
-                parts.push(binary);
-            } else {
-                let pos = 0, moofStart = -1;
-                while (pos < binary.length - 8) {
-                    const { size, type } = readBoxHdr(binary, pos);
-                    if (type === 'moof') { moofStart = pos; break; }
-                    if (size < 8) break;
-                    pos += size;
+        (async () => {
+            try {
+                recorder.start();
+                rafId = requestAnimationFrame(drawLoop);
+                for (let i = 0; i < blobs.length; i++) {
+                    onProgress && onProgress({ done: i + 1, total: blobs.length });
+                    console.log('[SnapDL] Re-encoding segment', i + 1, '/', blobs.length);
+                    await playOne(blobs[i]);
                 }
-                console.log('[SnapDL] Segment', i + 1, 'moof at byte', moofStart);
-                parts.push(moofStart >= 0 ? binary.slice(moofStart) : binary);
+                recorder.stop();
+            } catch (e) {
+                cleanup();
+                reject(e);
             }
-        }
-        return binaryToBlob(parts.join(''), blobs[0].type);
-    };
+        })();
+    });
 
     // ── Merge orchestrator ────────────────────────────────────────────────────
 
-    const mergeVideoSegments = async (blobUrls, onProgress) => {
-        // Step 1: fetch all segment blobs
-        const blobs = [];
-        for (let i = 0; i < blobUrls.length; i++) {
-            onProgress && onProgress({ phase: 'record', done: i + 1, total: blobUrls.length });
-            const resp = await fetch(blobUrls[i]);
-            const blob = await resp.blob();
-            console.log('[SnapDL] Fetched segment', i + 1, 'type:', blob.type, 'size:', blob.size);
-            blobs.push(blob);
-        }
-        if (blobs.length === 1) return blobs[0];
-
-        onProgress && onProgress({ phase: 'concat', done: blobs.length, total: blobs.length });
-
-        const outType = blobs[0].type || 'video/mp4';
-        if (!outType.includes('webm')) {
-            console.log('[SnapDL] MP4 segments → fMP4 concat');
-            return mergeMp4Segments(blobs);
-        }
-
-        // Step 2: patch Segment size in first blob to UNKNOWN so parsers read past it
-        const firstBlob = await ensureUnknownSegmentSize(blobs[0]);
-
-        // Step 3: cumulative duration offsets for Cluster Timecode patching
-        let cumMs = 0;
-        const offsets = [0];
-        for (let i = 0; i < blobs.length - 1; i++) {
-            const dur = await getWebMDurationMs(blobs[i]);
-            console.log('[SnapDL] Segment', i + 1, 'duration:', dur, 'ms');
-            cumMs += dur;
-            offsets.push(cumMs);
-        }
-
-        // Step 4: strip headers + patch timestamps in segments 2..N
-        const parts = [firstBlob];
-        for (let i = 1; i < blobs.length; i++) {
-            parts.push(await prepareAppendSegment(blobs[i], offsets[i]));
-        }
-
-        return new Blob(parts, { type: outType });
+    // `blobs` are already-fetched segment Blobs, captured as each segment's
+    // <video> first mounted (see captureVideoSegment) — merge no longer
+    // re-fetches blob: URLs, which may be stale/revoked by merge-click time.
+    const mergeVideoSegments = (blobs, onProgress) => {
+        if (blobs.length === 1) return Promise.resolve(blobs[0]);
+        return reencodeSegments(blobs, onProgress);
     };
 
     // ── i18n ─────────────────────────────────────────────────────────────────
@@ -374,23 +288,69 @@
                 bottom: 70px;
                 right: 20px;
                 z-index: 2147483647;
-                background: rgba(10, 10, 10, 0.88);
+                background: rgba(10, 10, 10, 0.92);
                 color: #fffc00;
                 border: 1px solid rgba(255, 252, 0, 0.6);
                 border-radius: 8px;
-                padding: 8px 14px;
+                padding: 10px;
                 font-size: 13px;
-                font-weight: bold;
-                cursor: pointer;
                 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
                 backdrop-filter: blur(8px);
-                transition: all 0.2s ease;
+                width: 220px;
+            }
+            .snap-dl-merge-header { font-weight: bold; margin-bottom: 6px; }
+            .snap-dl-merge-list {
+                max-height: 220px;
+                overflow-y: auto;
+                display: flex;
+                flex-direction: column;
+                gap: 4px;
+                margin-bottom: 8px;
+            }
+            .snap-dl-merge-item {
                 display: flex;
                 align-items: center;
                 gap: 6px;
+                color: #fff;
+                cursor: pointer;
+                padding: 3px;
+                border-radius: 4px;
             }
-            .snap-dl-merge-panel:hover:not(:disabled) { background: rgba(30, 30, 10, 0.96); transform: scale(1.04); }
-            .snap-dl-merge-panel:disabled { opacity: 0.65; cursor: default; }
+            .snap-dl-merge-item:hover { background: rgba(255, 255, 255, 0.08); }
+            .snap-dl-merge-thumb {
+                width: 40px;
+                height: 24px;
+                object-fit: cover;
+                border-radius: 3px;
+                background: #222;
+                flex: none;
+            }
+            .snap-dl-merge-thumb--empty { display: inline-block; }
+            .snap-dl-merge-label { font-size: 12px; flex: 1; }
+            .snap-dl-merge-remove {
+                background: none;
+                border: none;
+                color: rgba(255, 255, 255, 0.6);
+                cursor: pointer;
+                font-size: 14px;
+                line-height: 1;
+                padding: 2px 4px;
+            }
+            .snap-dl-merge-remove:hover { color: #fff; }
+            .snap-dl-merge-actions { display: flex; gap: 6px; }
+            .snap-dl-merge-actions button {
+                background: rgba(255, 255, 255, 0.1);
+                color: #fffc00;
+                border: 1px solid rgba(255, 252, 0, 0.6);
+                border-radius: 6px;
+                padding: 6px 10px;
+                font-size: 12px;
+                font-weight: bold;
+                cursor: pointer;
+            }
+            .snap-dl-merge-actions button:hover:not(:disabled) { background: rgba(255, 252, 0, 0.15); }
+            .snap-dl-merge-actions button:disabled { opacity: 0.65; cursor: default; }
+            .snap-dl-merge-actions [data-action="go"] { flex: 1; }
             .snap-dl-toast {
                 position: fixed;
                 bottom: 24px;
@@ -529,69 +489,158 @@
     };
 
     // ── Floating merge panel ──────────────────────────────────────────────────
-    // Appears fixed bottom-right whenever 2+ video blobs are in the DOM.
-    // User scrolls through split snaps to load them all, then clicks Merge.
+    // Appears fixed bottom-right whenever 2+ video segments have been captured.
+    // Captured segments accumulate for as long as the user scrolls the chat —
+    // not just one split story — so the panel lists every one with a thumbnail
+    // and a checkbox: the user picks exactly which ones to merge instead of
+    // everything ever seen this session getting mashed together.
 
     let _mergePanel = null;
     let _mergeInProgress = false;
+    // injectButtons() calls updateMergePanel() on every DOM mutation Snapchat's
+    // SPA fires — including plain scrolling, unrelated to segments — so most
+    // calls have nothing new to show. Rebuilding innerHTML anyway would reset
+    // .snap-dl-merge-list's scrollTop to 0 on every one of those, making the
+    // list unscrollable. Skip the rebuild entirely when nothing changed.
+    let _lastPanelKey = '';
+
+    const readySegments = () => capturedSegments.filter(s => s.blob);
 
     const updateMergePanel = () => {
         if (_mergeInProgress) return;
-        const segments = collectVideoBlobsInDomOrder();
+        const segments = readySegments();
         const { merge: mergeText } = getLang();
 
         if (segments.length < 2) {
             if (_mergePanel) { _mergePanel.remove(); _mergePanel = null; }
+            _lastPanelKey = '';
             return;
         }
 
+        const panelKey = segments
+            .map(s => `${s.blobUrl}:${s.thumb ? 1 : 0}:${_selectedBlobUrls.has(s.blobUrl) ? 1 : 0}`)
+            .join('|');
+        if (_mergePanel && panelKey === _lastPanelKey) return;
+        _lastPanelKey = panelKey;
+
+        const existingList = _mergePanel && _mergePanel.querySelector('.snap-dl-merge-list');
+        const savedScrollTop = existingList ? existingList.scrollTop : 0;
+
         if (!_mergePanel) {
-            _mergePanel = document.createElement('button');
+            _mergePanel = document.createElement('div');
             _mergePanel.className = 'snap-dl-merge-panel';
             document.body.appendChild(_mergePanel);
-
-            _mergePanel.onclick = async () => {
-                const btn = _mergePanel;
-                btn.disabled = true;
-                _mergeInProgress = true;
-                const current = collectVideoBlobsInDomOrder();
-                try {
-                    const blobUrls = current.map(s => s.blobUrl);
-                    const { rec: recText, concat: concatText } = getLang();
-                    console.log('[SnapDL] Merging', blobUrls.length, 'segments:', blobUrls);
-                    const merged = await mergeVideoSegments(blobUrls, ({ phase, done, total }) => {
-                        if (phase === 'record') {
-                            btn.innerHTML = `⏳ ${recText} ${done}/${total}`;
-                            console.log(`[SnapDL] Fetching segment ${done}/${total}`);
-                        } else {
-                            btn.innerHTML = `⏳ ${concatText}`;
-                            console.log('[SnapDL] Concatenating segments');
-                        }
-                    });
-                    console.log('[SnapDL] Merged blob:', merged.size, 'bytes, type:', merged.type);
-                    const mergedCt = merged.type || (current[0].meta && current[0].meta.contentType) || 'video/webm';
-                    const [, mergedExt] = CONTENT_TYPE_MAP[mergedCt.split(';')[0]] || ['video', 'webm'];
-                    const filename = buildFilename('video', mergedExt, current[0].meta, 'merged');
-                    const objectUrl = origCreateObjectURL(merged);
-                    console.log('[SnapDL] Download URL:', objectUrl, '→', filename);
-                    triggerDownload(objectUrl, filename);
-                    setTimeout(() => origRevokeObjectURL(objectUrl), 30000);
-                    showToast(filename, !!(current[0].meta && current[0].meta.date));
-                    btn.textContent = '✅';
-                    setTimeout(() => { _mergeInProgress = false; btn.disabled = false; updateMergePanel(); }, 4000);
-                } catch (err) {
-                    console.error('[SnapDL] Merge failed:', err);
-                    btn.textContent = `❌ ${err.message || 'Error'}`;
-                    setTimeout(() => {
-                        _mergeInProgress = false;
-                        btn.disabled = false;
-                        updateMergePanel();
-                    }, 4000);
-                }
-            };
         }
 
-        _mergePanel.innerHTML = `<span>⬇⬇</span> ${mergeText} (${segments.length})`;
+        const selectedCount = segments.filter(s => _selectedBlobUrls.has(s.blobUrl)).length;
+        const updateCount = () => {
+            const el = _mergePanel.querySelector('[data-role="count"]');
+            if (el) el.textContent = segments.filter(s => _selectedBlobUrls.has(s.blobUrl)).length;
+        };
+
+        _mergePanel.innerHTML = `
+            <div class="snap-dl-merge-header">${mergeText} — <span data-role="count">${selectedCount}</span>/${segments.length}</div>
+            <div class="snap-dl-merge-list"></div>
+            <div class="snap-dl-merge-actions">
+                <button type="button" data-action="clear">✕</button>
+                <button type="button" data-action="go">⬇⬇ ${mergeText}</button>
+            </div>
+        `;
+
+        const list = _mergePanel.querySelector('.snap-dl-merge-list');
+        segments.forEach((seg, i) => {
+            const row = document.createElement('label');
+            row.className = 'snap-dl-merge-item';
+
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.checked = _selectedBlobUrls.has(seg.blobUrl);
+            cb.onchange = () => {
+                if (cb.checked) _selectedBlobUrls.add(seg.blobUrl);
+                else _selectedBlobUrls.delete(seg.blobUrl);
+                updateCount();
+            };
+            row.appendChild(cb);
+
+            if (seg.thumb) {
+                const img = document.createElement('img');
+                img.src = seg.thumb;
+                img.className = 'snap-dl-merge-thumb';
+                row.appendChild(img);
+            } else {
+                const ph = document.createElement('span');
+                ph.className = 'snap-dl-merge-thumb snap-dl-merge-thumb--empty';
+                row.appendChild(ph);
+            }
+
+            const label = document.createElement('span');
+            label.className = 'snap-dl-merge-label';
+            label.textContent = `#${i + 1} · ${(seg.blob.size / 1e6).toFixed(1)}MB`;
+            row.appendChild(label);
+
+            const rm = document.createElement('button');
+            rm.type = 'button';
+            rm.className = 'snap-dl-merge-remove';
+            rm.textContent = '×';
+            rm.onclick = (e) => {
+                e.preventDefault();
+                _selectedBlobUrls.delete(seg.blobUrl);
+                const idx = capturedSegments.indexOf(seg);
+                if (idx >= 0) capturedSegments.splice(idx, 1);
+                updateMergePanel();
+            };
+            row.appendChild(rm);
+
+            list.appendChild(row);
+        });
+        list.scrollTop = savedScrollTop;
+
+        _mergePanel.querySelector('[data-action="clear"]').onclick = () => {
+            capturedSegments.length = 0;
+            _selectedBlobUrls.clear();
+            updateMergePanel();
+        };
+
+        _mergePanel.querySelector('[data-action="go"]').onclick = async () => {
+            const goBtn = _mergePanel.querySelector('[data-action="go"]');
+            const chosen = segments.filter(s => _selectedBlobUrls.has(s.blobUrl));
+            if (chosen.length < 2) {
+                showToast('Select at least 2 videos', true);
+                return;
+            }
+            goBtn.disabled = true;
+            _mergeInProgress = true;
+            try {
+                const blobs = chosen.map(s => s.blob);
+                const { concat: concatText } = getLang();
+                console.log('[SnapDL] Merging', blobs.length, 'segments');
+                const merged = await mergeVideoSegments(blobs, ({ done, total }) => {
+                    goBtn.textContent = `⏳ ${concatText} ${done}/${total}`;
+                });
+                console.log('[SnapDL] Merged blob:', merged.size, 'bytes, type:', merged.type);
+                const mergedCt = merged.type || (chosen[0].meta && chosen[0].meta.contentType) || 'video/webm';
+                const [, mergedExt] = CONTENT_TYPE_MAP[mergedCt.split(';')[0]] || ['video', 'webm'];
+                const filename = buildFilename('video', mergedExt, chosen[0].meta, 'merged');
+                const objectUrl = origCreateObjectURL(merged);
+                console.log('[SnapDL] Download URL:', objectUrl, '→', filename);
+                triggerDownload(objectUrl, filename);
+                setTimeout(() => origRevokeObjectURL(objectUrl), 30000);
+                showToast(filename, !!(chosen[0].meta && chosen[0].meta.date));
+                chosen.forEach(s => {
+                    _selectedBlobUrls.delete(s.blobUrl);
+                    const idx = capturedSegments.indexOf(s);
+                    if (idx >= 0) capturedSegments.splice(idx, 1);
+                });
+                _mergeInProgress = false;
+                updateMergePanel();
+            } catch (err) {
+                console.error('[SnapDL] Merge failed:', err);
+                showToast(`Merge failed: ${err.message || 'Error'}`, true);
+                _mergeInProgress = false;
+                goBtn.disabled = false;
+                goBtn.textContent = `⬇⬇ ${mergeText}`;
+            }
+        };
     };
 
     // ── Button injection ──────────────────────────────────────────────────────
@@ -605,6 +654,7 @@
             if (el.dataset.snapDlReady) return;
 
             el.dataset.snapDlReady = 'true';
+            if (el instanceof HTMLVideoElement) captureVideoSegment(src);
             const container = el.parentElement;
             if (!container) return;
 

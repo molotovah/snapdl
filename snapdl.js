@@ -2,7 +2,7 @@
 // @name         Snapchat Image & Video Downloader (HD)
 // @name:fr      Snapchat Téléchargeur d'images et de vidéos (HD)
 // @namespace    https://github.com/Molotovah
-// @version      3.12.0
+// @version      3.13.0
 // @description  Download Snapchat images and videos in full resolution. Auto-detects split video segments and merges them into one file.
 // @description:fr Téléchargez images et vidéos Snapchat en pleine résolution. Détecte et fusionne automatiquement les vidéos découpées en plusieurs snaps.
 // @author       Molotovah (https://github.com/Molotovah)
@@ -232,6 +232,42 @@
         return binaryToBlob(parts.join(''), blob.type);
     };
 
+    // ── Fragmented MP4 (fMP4 / CMAF / DASH) concatenation ────────────────────
+    // Snapchat serves MP4 segments. Each is a self-contained fMP4 fragment:
+    //   Segment 1: [ftyp][moov][moof][mdat]   ← has init data
+    //   Segment N: [styp][sidx][moof][mdat]   ← only fragment data
+    // Keep segment 1 intact. For segments 2..N scan MP4 boxes and start from
+    // the first `moof` box (skipping ftyp/styp/sidx init boxes that would
+    // confuse parsers if duplicated). DASH timestamps in `tfdt` are absolute
+    // so no patching needed — they're already monotonically increasing.
+
+    const mergeMp4Segments = async (blobs) => {
+        const readBoxHdr = (binary, pos) => ({
+            size: binary.charCodeAt(pos) * 16777216 + binary.charCodeAt(pos + 1) * 65536 +
+                  binary.charCodeAt(pos + 2) * 256   + binary.charCodeAt(pos + 3),
+            type: binary.slice(pos + 4, pos + 8)
+        });
+
+        const parts = [];
+        for (let i = 0; i < blobs.length; i++) {
+            const binary = await readBlobBinary(blobs[i]);
+            if (i === 0) {
+                parts.push(binary);
+            } else {
+                let pos = 0, moofStart = -1;
+                while (pos < binary.length - 8) {
+                    const { size, type } = readBoxHdr(binary, pos);
+                    if (type === 'moof') { moofStart = pos; break; }
+                    if (size < 8) break;
+                    pos += size;
+                }
+                console.log('[SnapDL] Segment', i + 1, 'moof at byte', moofStart);
+                parts.push(moofStart >= 0 ? binary.slice(moofStart) : binary);
+            }
+        }
+        return binaryToBlob(parts.join(''), blobs[0].type);
+    };
+
     // ── Merge orchestrator ────────────────────────────────────────────────────
 
     const mergeVideoSegments = async (blobUrls, onProgress) => {
@@ -248,10 +284,10 @@
 
         onProgress && onProgress({ phase: 'concat', done: blobs.length, total: blobs.length });
 
-        const outType = blobs[0].type || 'video/webm';
+        const outType = blobs[0].type || 'video/mp4';
         if (!outType.includes('webm')) {
-            console.warn('[SnapDL] Non-WebM format:', outType, '— raw concat may not work');
-            return new Blob(blobs, { type: outType });
+            console.log('[SnapDL] MP4 segments → fMP4 concat');
+            return mergeMp4Segments(blobs);
         }
 
         // Step 2: patch Segment size in first blob to UNKNOWN so parsers read past it

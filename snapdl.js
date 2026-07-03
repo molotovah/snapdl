@@ -2,7 +2,7 @@
 // @name         Snapchat Image & Video Downloader (HD)
 // @name:fr      Snapchat Téléchargeur d'images et de vidéos (HD)
 // @namespace    https://github.com/Molotovah
-// @version      3.15.1
+// @version      3.15.2
 // @description  Download Snapchat images and videos in full resolution. Auto-detects split video segments and merges them into one file.
 // @description:fr Téléchargez images et vidéos Snapchat en pleine résolution. Détecte et fusionne automatiquement les vidéos découpées en plusieurs snaps.
 // @author       Molotovah (https://github.com/Molotovah)
@@ -108,7 +108,7 @@
     // is seen. Safe to call repeatedly — dedupes on blobUrl.
     const captureVideoSegment = (src) => {
         if (capturedSegments.some(s => s.blobUrl === src)) return;
-        const placeholder = { blobUrl: src, blob: null, meta: blobUrlMeta.get(src), thumb: null, capturedAt: Date.now() };
+        const placeholder = { blobUrl: src, blob: null, meta: blobUrlMeta.get(src), thumb: null };
         capturedSegments.push(placeholder);
         fetch(src).then(r => r.blob()).then(blob => {
             placeholder.blob = blob;
@@ -307,20 +307,6 @@
                 gap: 4px;
                 margin-bottom: 8px;
             }
-            .snap-dl-merge-batch {
-                display: flex;
-                align-items: center;
-                gap: 6px;
-                color: #fffc00;
-                font-size: 11px;
-                font-weight: bold;
-                text-transform: uppercase;
-                letter-spacing: 0.02em;
-                padding: 4px 3px 2px;
-                margin-top: 4px;
-                border-top: 1px solid rgba(255, 252, 0, 0.25);
-            }
-            .snap-dl-merge-batch:first-child { margin-top: 0; border-top: none; }
             .snap-dl-merge-item {
                 display: flex;
                 align-items: center;
@@ -331,7 +317,6 @@
                 border-radius: 4px;
             }
             .snap-dl-merge-item:hover { background: rgba(255, 255, 255, 0.08); }
-            .snap-dl-merge-item--batched { margin-left: 14px; }
             .snap-dl-merge-thumb {
                 width: 40px;
                 height: 24px;
@@ -521,33 +506,6 @@
 
     const readySegments = () => capturedSegments.filter(s => s.blob);
 
-    // Snapchat gives no explicit "these parts are one split video" id. The
-    // server-provided date (CDN url params / Last-Modified header) looked
-    // like a proxy for it, but Last-Modified/Date aren't in the CORS-safelisted
-    // response headers, so `fetch()` can't read them on Snapchat's
-    // cross-origin CDN responses — meta.date is null in practice, and every
-    // segment ended up its own singleton. Use client-side capture time
-    // instead (see captureVideoSegment): parts of the same split video get
-    // discovered by the MutationObserver within a couple seconds of each
-    // other, while reaching an unrelated video takes deliberate scrolling.
-    const BATCH_GAP_MS = 15000;
-    const groupSegmentsByBatch = (segments) => {
-        const groups = [];
-        let current = null;
-        let lastT = null;
-        for (const seg of segments) {
-            const t = seg.capturedAt;
-            if (current && lastT != null && Math.abs(t - lastT) <= BATCH_GAP_MS) {
-                current.push(seg);
-            } else {
-                current = [seg];
-                groups.push(current);
-            }
-            lastT = t;
-        }
-        return groups;
-    };
-
     const updateMergePanel = () => {
         if (_mergeInProgress) return;
         const segments = readySegments();
@@ -590,95 +548,50 @@
         `;
 
         const list = _mergePanel.querySelector('.snap-dl-merge-list');
-        const groups = groupSegmentsByBatch(segments);
-        let segIndex = 0;
-        let batchNumber = 0;
+        segments.forEach((seg, i) => {
+            const row = document.createElement('label');
+            row.className = 'snap-dl-merge-item';
 
-        groups.forEach((group) => {
-            const isBatch = group.length > 1;
-            if (isBatch) batchNumber++;
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.checked = _selectedBlobUrls.has(seg.blobUrl);
+            cb.onchange = () => {
+                if (cb.checked) _selectedBlobUrls.add(seg.blobUrl);
+                else _selectedBlobUrls.delete(seg.blobUrl);
+                updateCount();
+            };
+            row.appendChild(cb);
 
-            const itemCbByUrl = new Map(); // blobUrl → item checkbox, so the group checkbox can drive them
-            let refreshGroupCbState = null;
-            if (isBatch) {
-                const header = document.createElement('div');
-                header.className = 'snap-dl-merge-batch';
-
-                const groupCb = document.createElement('input');
-                groupCb.type = 'checkbox';
-                refreshGroupCbState = () => {
-                    const checkedCount = group.filter(s => _selectedBlobUrls.has(s.blobUrl)).length;
-                    groupCb.checked = checkedCount === group.length;
-                    groupCb.indeterminate = checkedCount > 0 && checkedCount < group.length;
-                };
-                groupCb.onchange = () => {
-                    group.forEach(s => {
-                        if (groupCb.checked) _selectedBlobUrls.add(s.blobUrl);
-                        else _selectedBlobUrls.delete(s.blobUrl);
-                        const itemCb = itemCbByUrl.get(s.blobUrl);
-                        if (itemCb) itemCb.checked = groupCb.checked;
-                    });
-                    groupCb.indeterminate = false;
-                    updateCount();
-                };
-                header.appendChild(groupCb);
-
-                const label = document.createElement('span');
-                label.textContent = `Lot ${batchNumber} · ${group.length} vidéos`;
-                header.appendChild(label);
-
-                list.appendChild(header);
-                refreshGroupCbState();
+            if (seg.thumb) {
+                const img = document.createElement('img');
+                img.src = seg.thumb;
+                img.className = 'snap-dl-merge-thumb';
+                row.appendChild(img);
+            } else {
+                const ph = document.createElement('span');
+                ph.className = 'snap-dl-merge-thumb snap-dl-merge-thumb--empty';
+                row.appendChild(ph);
             }
 
-            group.forEach((seg) => {
-                const i = segIndex++;
-                const row = document.createElement('label');
-                row.className = isBatch ? 'snap-dl-merge-item snap-dl-merge-item--batched' : 'snap-dl-merge-item';
+            const label = document.createElement('span');
+            label.className = 'snap-dl-merge-label';
+            label.textContent = `#${i + 1} · ${(seg.blob.size / 1e6).toFixed(1)}MB`;
+            row.appendChild(label);
 
-                const cb = document.createElement('input');
-                cb.type = 'checkbox';
-                cb.checked = _selectedBlobUrls.has(seg.blobUrl);
-                cb.onchange = () => {
-                    if (cb.checked) _selectedBlobUrls.add(seg.blobUrl);
-                    else _selectedBlobUrls.delete(seg.blobUrl);
-                    updateCount();
-                    if (refreshGroupCbState) refreshGroupCbState();
-                };
-                row.appendChild(cb);
-                if (isBatch) itemCbByUrl.set(seg.blobUrl, cb);
+            const rm = document.createElement('button');
+            rm.type = 'button';
+            rm.className = 'snap-dl-merge-remove';
+            rm.textContent = '×';
+            rm.onclick = (e) => {
+                e.preventDefault();
+                _selectedBlobUrls.delete(seg.blobUrl);
+                const idx = capturedSegments.indexOf(seg);
+                if (idx >= 0) capturedSegments.splice(idx, 1);
+                updateMergePanel();
+            };
+            row.appendChild(rm);
 
-                if (seg.thumb) {
-                    const img = document.createElement('img');
-                    img.src = seg.thumb;
-                    img.className = 'snap-dl-merge-thumb';
-                    row.appendChild(img);
-                } else {
-                    const ph = document.createElement('span');
-                    ph.className = 'snap-dl-merge-thumb snap-dl-merge-thumb--empty';
-                    row.appendChild(ph);
-                }
-
-                const label = document.createElement('span');
-                label.className = 'snap-dl-merge-label';
-                label.textContent = `#${i + 1} · ${(seg.blob.size / 1e6).toFixed(1)}MB`;
-                row.appendChild(label);
-
-                const rm = document.createElement('button');
-                rm.type = 'button';
-                rm.className = 'snap-dl-merge-remove';
-                rm.textContent = '×';
-                rm.onclick = (e) => {
-                    e.preventDefault();
-                    _selectedBlobUrls.delete(seg.blobUrl);
-                    const idx = capturedSegments.indexOf(seg);
-                    if (idx >= 0) capturedSegments.splice(idx, 1);
-                    updateMergePanel();
-                };
-                row.appendChild(rm);
-
-                list.appendChild(row);
-            });
+            list.appendChild(row);
         });
         list.scrollTop = savedScrollTop;
 

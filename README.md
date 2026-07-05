@@ -17,6 +17,9 @@ Greasemonkey support.
 ## Features
 
 - **Download button** on every image and video in the conversation.
+- **Bulk download**: once 2+ media are detected, a floating "Download all"
+  button appears and downloads every one of them, staggered to avoid the
+  browser's multi-download prompt/block.
 - **Double-click** an image/video as a shortcut to download it.
 - Detects the real content type (mp4/webm/etc.) from the response so files
   get the correct extension.

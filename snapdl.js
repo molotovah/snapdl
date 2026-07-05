@@ -2,9 +2,9 @@
 // @name         Snapchat Image & Video Downloader (HD)
 // @name:fr      Snapchat Téléchargeur d'images et de vidéos (HD)
 // @namespace    https://github.com/Molotovah
-// @version      3.16.0
-// @description  Download Snapchat images and videos in full resolution, in their original format, via your browser's download manager.
-// @description:fr Téléchargez images et vidéos Snapchat en pleine résolution, dans leur format d'origine, via le gestionnaire de téléchargements du navigateur.
+// @version      3.17.0
+// @description  Download Snapchat images and videos in full resolution, in their original format, via your browser's download manager. Includes a bulk "download all" button.
+// @description:fr Téléchargez images et vidéos Snapchat en pleine résolution, dans leur format d'origine, via le gestionnaire de téléchargements du navigateur. Inclut un bouton de téléchargement groupé.
 // @author       Molotovah (https://github.com/Molotovah)
 // @match        *://*.snapchat.com/*
 // @grant        none
@@ -71,21 +71,21 @@
     // ── i18n ─────────────────────────────────────────────────────────────────
 
     const translations = {
-        en: { btn: 'Download', toast: 'Downloading' },
-        tr: { btn: 'İndir', toast: 'İndiriliyor' },
-        es: { btn: 'Descargar', toast: 'Descargando' },
-        fr: { btn: 'Télécharger', toast: 'Téléchargement' },
-        de: { btn: 'Herunterladen', toast: 'Wird heruntergeladen' },
-        pt: { btn: 'Baixar', toast: 'Baixando' },
-        ru: { btn: 'Скачать', toast: 'Скачивание' },
-        zh: { btn: '下载', toast: '下载中' },
-        hi: { btn: 'डाउनलोड', toast: 'डाउनलोड हो रहा है' },
-        ar: { btn: 'تنزيل', toast: 'جارٍ التنزيل' },
-        ja: { btn: 'ダウンロード', toast: 'ダウンロード中' },
-        ko: { btn: '다운로드', toast: '다운로드 중' },
-        bn: { btn: 'ডাউনলোড', toast: 'ডাউনলোড হচ্ছে' },
-        it: { btn: 'Scarica', toast: 'Scaricamento' },
-        id: { btn: 'Unduh', toast: 'Mengunduh' }
+        en: { btn: 'Download', toast: 'Downloading', bulk: 'Download all' },
+        tr: { btn: 'İndir', toast: 'İndiriliyor', bulk: 'Tümünü indir' },
+        es: { btn: 'Descargar', toast: 'Descargando', bulk: 'Descargar todo' },
+        fr: { btn: 'Télécharger', toast: 'Téléchargement', bulk: 'Tout télécharger' },
+        de: { btn: 'Herunterladen', toast: 'Wird heruntergeladen', bulk: 'Alle herunterladen' },
+        pt: { btn: 'Baixar', toast: 'Baixando', bulk: 'Baixar tudo' },
+        ru: { btn: 'Скачать', toast: 'Скачивание', bulk: 'Скачать всё' },
+        zh: { btn: '下载', toast: '下载中', bulk: '全部下载' },
+        hi: { btn: 'डाउनलोड', toast: 'डाउनलोड हो रहा है', bulk: 'सभी डाउनलोड करें' },
+        ar: { btn: 'تنزيل', toast: 'جارٍ التنزيل', bulk: 'تنزيل الكل' },
+        ja: { btn: 'ダウンロード', toast: 'ダウンロード中', bulk: 'すべてダウンロード' },
+        ko: { btn: '다운로드', toast: '다운로드 중', bulk: '전체 다운로드' },
+        bn: { btn: 'ডাউনলোড', toast: 'ডাউনলোড হচ্ছে', bulk: 'সব ডাউনলোড করুন' },
+        it: { btn: 'Scarica', toast: 'Scaricamento', bulk: 'Scarica tutto' },
+        id: { btn: 'Unduh', toast: 'Mengunduh', bulk: 'Unduh semua' }
     };
 
     const getLang = () => {
@@ -125,6 +125,24 @@
             }
             .snap-dl-btn:disabled { opacity: 0.65; cursor: default; }
             .snap-container-relative { position: relative !important; }
+            .snap-dl-bulk-btn {
+                position: fixed;
+                bottom: 70px;
+                right: 20px;
+                z-index: 2147483647;
+                background: rgba(10, 10, 10, 0.92);
+                color: #fffc00;
+                border: 1px solid rgba(255, 252, 0, 0.6);
+                border-radius: 8px;
+                padding: 10px 14px;
+                font-size: 13px;
+                font-weight: bold;
+                cursor: pointer;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                backdrop-filter: blur(8px);
+            }
+            .snap-dl-bulk-btn:hover:not(:disabled) { background: rgba(255, 252, 0, 0.15); }
+            .snap-dl-bulk-btn:disabled { opacity: 0.65; cursor: default; }
             .snap-dl-toast {
                 position: fixed;
                 bottom: 24px;
@@ -241,7 +259,7 @@
     // The blob itself is downloaded as-is — original resolution and codec,
     // never transcoded.
 
-    const downloadMedia = async (el) => {
+    const downloadMedia = async (el, { silent } = {}) => {
         const src = el.currentSrc || el.src;
         if (!src || !src.startsWith('blob:')) return;
 
@@ -263,7 +281,65 @@
         const filename = buildFilename(fileType, ext, meta);
         console.log('[SnapDL] Downloading:', filename, '(type:', contentType || 'unknown', ')');
         triggerDownload(src, filename);
-        showToast(filename, !!(meta && meta.date));
+        if (!silent) showToast(filename, !!(meta && meta.date));
+    };
+
+    // ── Bulk download ─────────────────────────────────────────────────────────
+    // Downloads every media element currently detected in the DOM. Same
+    // mount-only limitation as the per-item button: Snapchat's feed is
+    // virtualized, so anything scrolled out of view and unmounted isn't
+    // included — scroll through the conversation first to load it all.
+
+    let _bulkBtn = null;
+    let _bulkInProgress = false;
+
+    const getDownloadableMedia = () =>
+        Array.from(document.querySelectorAll('img[data-snap-dl-ready], video[data-snap-dl-ready]'));
+
+    const updateBulkButton = () => {
+        if (_bulkInProgress) return;
+        const media = getDownloadableMedia();
+
+        if (media.length < 2) {
+            if (_bulkBtn) { _bulkBtn.remove(); _bulkBtn = null; }
+            return;
+        }
+
+        const { bulk: bulkText } = getLang();
+        if (!_bulkBtn) {
+            _bulkBtn = document.createElement('button');
+            _bulkBtn.type = 'button';
+            _bulkBtn.className = 'snap-dl-bulk-btn';
+            _bulkBtn.onclick = runBulkDownload;
+            document.body.appendChild(_bulkBtn);
+        }
+        _bulkBtn.textContent = `⬇⬇ ${bulkText} (${media.length})`;
+    };
+
+    const runBulkDownload = async () => {
+        const media = getDownloadableMedia();
+        if (!media.length || !_bulkBtn) return;
+
+        const { bulk: bulkText } = getLang();
+        _bulkInProgress = true;
+        _bulkBtn.disabled = true;
+        let ok = 0;
+
+        for (let i = 0; i < media.length; i++) {
+            _bulkBtn.textContent = `⏳ ${bulkText} ${i + 1}/${media.length}`;
+            try {
+                await downloadMedia(media[i], { silent: true });
+                ok++;
+            } catch (e) {
+                console.error('[SnapDL] Bulk download failed for item', i + 1, e);
+            }
+            await new Promise(r => setTimeout(r, 400)); // stagger — avoids Chrome's multi-download block
+        }
+
+        showToast(`${ok}/${media.length}`, true);
+        _bulkInProgress = false;
+        _bulkBtn.disabled = false;
+        updateBulkButton();
     };
 
     // ── Button injection ──────────────────────────────────────────────────────
@@ -287,6 +363,8 @@
             btn.onclick = (e) => { e.preventDefault(); e.stopPropagation(); downloadMedia(el).catch(err => console.error('[SnapDL] Download failed:', err)); };
             container.appendChild(btn);
         });
+
+        updateBulkButton();
     };
 
     // ── Double-click shortcut ─────────────────────────────────────────────────

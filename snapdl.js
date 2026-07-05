@@ -2,9 +2,9 @@
 // @name         Snapchat Image & Video Downloader (HD)
 // @name:fr      Snapchat Téléchargeur d'images et de vidéos (HD)
 // @namespace    https://github.com/Molotovah
-// @version      3.15.2
-// @description  Download Snapchat images and videos in full resolution. Auto-detects split video segments and merges them into one file.
-// @description:fr Téléchargez images et vidéos Snapchat en pleine résolution. Détecte et fusionne automatiquement les vidéos découpées en plusieurs snaps.
+// @version      3.16.0
+// @description  Download Snapchat images and videos in full resolution, in their original format, via your browser's download manager.
+// @description:fr Téléchargez images et vidéos Snapchat en pleine résolution, dans leur format d'origine, via le gestionnaire de téléchargements du navigateur.
 // @author       Molotovah (https://github.com/Molotovah)
 // @match        *://*.snapchat.com/*
 // @grant        none
@@ -20,20 +20,10 @@
     // ── Blob interception ─────────────────────────────────────────────────────
     // Runs at document-start, before Snapchat JS.
     // Chain: fetch(CDN) → Response.blob() → Blob → createObjectURL → blob:url
-    // We tag each Blob via WeakMap so date + sourceUrl can be resolved later.
+    // We tag each blob: URL via a Map so date + content-type can be resolved
+    // later, without a second network fetch, when the download button fires.
 
-    const blobMeta = new WeakMap(); // Blob → { date?, sourceUrl? }
-    const blobUrlMeta = new Map(); // "blob:…" → { date?, sourceUrl? }
-
-    // Snapchat's feed is virtualized: once the user scrolls past a split-video
-    // segment, its <video> gets unmounted (and often its blob: URL revoked) to
-    // free memory. Waiting until merge-click time to fetch each segment (the
-    // old approach) meant only the still-mounted segment was ever available,
-    // so "merge" silently downloaded a single segment instead. Capture each
-    // segment's Blob content the moment it's first seen, independent of DOM
-    // survival, and merge from this cache instead of re-querying the DOM.
-    const capturedSegments = []; // [{ blobUrl, blob, meta, thumb }] in first-seen order
-    const _selectedBlobUrls = new Set(); // segments the user has checked for the next merge
+    const blobUrlMeta = new Map(); // "blob:…" → { date?, sourceUrl?, contentType? }
 
     const parseDateFromCdnUrl = (urlStr) => {
         try {
@@ -61,14 +51,14 @@
         if (date && !isNaN(date.getTime())) meta.date = date;
         if (this.url) meta.sourceUrl = this.url;
         if (contentType) meta.contentType = contentType;
-        if (meta.date || meta.sourceUrl || meta.contentType) blobMeta.set(blob, meta);
+        if (meta.date || meta.sourceUrl || meta.contentType) blob.__snapDlMeta = meta;
         return blob;
     };
 
     const origCreateObjectURL = URL.createObjectURL.bind(URL);
     URL.createObjectURL = function (source) {
         const url = origCreateObjectURL(source);
-        if (blobMeta.has(source)) blobUrlMeta.set(url, blobMeta.get(source));
+        if (source && source.__snapDlMeta) blobUrlMeta.set(url, source.__snapDlMeta);
         return url;
     };
 
@@ -78,172 +68,24 @@
         origRevokeObjectURL(url);
     };
 
-    // ── Segment collection ────────────────────────────────────────────────────
-    // Snapchat uses opaque CDN URLs. The floating panel lets the user merge
-    // segments explicitly after scrolling through all of them to load them.
-
-    // Grabs a single frame as a small JPEG data URL so the merge picker can
-    // show *which* video is which — segments have no other identifying label.
-    const generateThumbnail = (blob) => new Promise((resolve) => {
-        const video = document.createElement('video');
-        video.muted = true;
-        video.playsInline = true;
-        video.preload = 'metadata';
-        const url = origCreateObjectURL(blob);
-        const done = (dataUrl) => { origRevokeObjectURL(url); video.remove(); resolve(dataUrl); };
-        video.addEventListener('loadeddata', () => {
-            try {
-                const canvas = document.createElement('canvas');
-                canvas.width = 80;
-                canvas.height = Math.round(80 * ((video.videoHeight / video.videoWidth) || 0.5625));
-                canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
-                done(canvas.toDataURL('image/jpeg', 0.6));
-            } catch (e) { done(null); }
-        }, { once: true });
-        video.addEventListener('error', () => done(null), { once: true });
-        video.src = url;
-    });
-
-    // Fetches and caches a video segment's Blob the first time its blob: URL
-    // is seen. Safe to call repeatedly — dedupes on blobUrl.
-    const captureVideoSegment = (src) => {
-        if (capturedSegments.some(s => s.blobUrl === src)) return;
-        const placeholder = { blobUrl: src, blob: null, meta: blobUrlMeta.get(src), thumb: null };
-        capturedSegments.push(placeholder);
-        fetch(src).then(r => r.blob()).then(blob => {
-            placeholder.blob = blob;
-            _selectedBlobUrls.add(src); // captured segments are merge-selected by default
-            console.log('[SnapDL] Captured segment', capturedSegments.length, 'size:', blob.size);
-            updateMergePanel();
-            generateThumbnail(blob).then(thumb => { placeholder.thumb = thumb; updateMergePanel(); });
-        }).catch(e => {
-            console.warn('[SnapDL] Segment capture failed:', e.message);
-            const idx = capturedSegments.indexOf(placeholder);
-            if (idx >= 0) capturedSegments.splice(idx, 1);
-        });
-    };
-
-    // ── Merge: re-encode via canvas + MediaRecorder ───────────────────────────
-    // Real Snapchat segments turned out to be standalone, complete MP4 files
-    // (no `moof` box at all in most of them — that's why byte-level fMP4
-    // concatenation kept failing to find one), not true DASH/CMAF fragments.
-    // Byte-level splicing of independent MP4/WebM files can't produce a
-    // container that plays past the first file without a real muxer, which a
-    // userscript can't reasonably ship. Instead: play each segment through a
-    // hidden <video>, draw its frames to a <canvas>, pipe canvas + WebAudio
-    // output into one continuous MediaRecorder stream. Works regardless of
-    // source container/codec, at the cost of a real-time re-encode pass.
-
-    const reencodeSegments = (blobs, onProgress) => new Promise((resolve, reject) => {
-        const AudioCtx = window.AudioContext || window.webkitAudioContext;
-        const audioCtx = new AudioCtx();
-        const dest = audioCtx.createMediaStreamDestination();
-        const canvas = document.createElement('canvas');
-        const ctx = canvas.getContext('2d');
-        const video = document.createElement('video');
-        video.muted = true;
-        video.playsInline = true;
-        video.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;';
-        document.body.appendChild(video);
-
-        let audioSource = null; // an element can only be wrapped by one MediaElementSourceNode, ever
-        let rafId = null;
-        let stopped = false;
-
-        const cleanup = () => {
-            if (stopped) return;
-            stopped = true;
-            if (rafId) cancelAnimationFrame(rafId);
-            video.pause();
-            video.remove();
-            audioCtx.close().catch(() => {});
-        };
-
-        const drawLoop = () => {
-            if (stopped) return;
-            if (canvas.width && !video.paused && !video.ended) {
-                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-            }
-            rafId = requestAnimationFrame(drawLoop);
-        };
-
-        const canvasStream = canvas.captureStream(30);
-        const mixedStream = new MediaStream([...canvasStream.getVideoTracks(), ...dest.stream.getAudioTracks()]);
-        const mimeType = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm']
-            .find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || 'video/webm';
-        const recorder = new MediaRecorder(mixedStream, { mimeType });
-        const chunks = [];
-        recorder.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
-        recorder.onstop = () => { cleanup(); resolve(new Blob(chunks, { type: mimeType })); };
-
-        const playOne = (blob) => new Promise((res, rej) => {
-            const url = origCreateObjectURL(blob);
-            const onLoaded = () => {
-                canvas.width = video.videoWidth || canvas.width || 640;
-                canvas.height = video.videoHeight || canvas.height || 360;
-                if (!audioSource) { audioSource = audioCtx.createMediaElementSource(video); audioSource.connect(dest); }
-                video.play().catch(onError);
-            };
-            const onEnded = () => { teardown(); res(); };
-            const onError = (e) => { teardown(); rej(e instanceof Error ? e : new Error('Segment playback failed')); };
-            const teardown = () => {
-                video.removeEventListener('loadedmetadata', onLoaded);
-                video.removeEventListener('ended', onEnded);
-                video.removeEventListener('error', onError);
-                origRevokeObjectURL(url);
-            };
-            video.addEventListener('loadedmetadata', onLoaded, { once: true });
-            video.addEventListener('ended', onEnded, { once: true });
-            video.addEventListener('error', onError, { once: true });
-            video.src = url;
-            video.load();
-        });
-
-        (async () => {
-            try {
-                recorder.start();
-                rafId = requestAnimationFrame(drawLoop);
-                for (let i = 0; i < blobs.length; i++) {
-                    onProgress && onProgress({ done: i + 1, total: blobs.length });
-                    console.log('[SnapDL] Re-encoding segment', i + 1, '/', blobs.length);
-                    await playOne(blobs[i]);
-                }
-                recorder.stop();
-            } catch (e) {
-                cleanup();
-                reject(e);
-            }
-        })();
-    });
-
-    // ── Merge orchestrator ────────────────────────────────────────────────────
-
-    // `blobs` are already-fetched segment Blobs, captured as each segment's
-    // <video> first mounted (see captureVideoSegment) — merge no longer
-    // re-fetches blob: URLs, which may be stale/revoked by merge-click time.
-    const mergeVideoSegments = (blobs, onProgress) => {
-        if (blobs.length === 1) return Promise.resolve(blobs[0]);
-        return reencodeSegments(blobs, onProgress);
-    };
-
     // ── i18n ─────────────────────────────────────────────────────────────────
 
     const translations = {
-        en: { btn: 'Download', merge: 'Merge', toast: 'Downloading', rec: 'Loading', concat: 'Merging…' },
-        tr: { btn: 'İndir', merge: 'Birleştir', toast: 'İndiriliyor', rec: 'Yükleniyor', concat: 'Birleştiriliyor…' },
-        es: { btn: 'Descargar', merge: 'Combinar', toast: 'Descargando', rec: 'Cargando', concat: 'Combinando…' },
-        fr: { btn: 'Télécharger', merge: 'Fusionner', toast: 'Téléchargement', rec: 'Chargement', concat: 'Fusion…' },
-        de: { btn: 'Herunterladen', merge: 'Zusammenführen', toast: 'Wird heruntergeladen', rec: 'Laden', concat: 'Zusammenführen…' },
-        pt: { btn: 'Baixar', merge: 'Mesclar', toast: 'Baixando', rec: 'Carregando', concat: 'Mesclando…' },
-        ru: { btn: 'Скачать', merge: 'Объединить', toast: 'Скачивание', rec: 'Загрузка', concat: 'Объединение…' },
-        zh: { btn: '下载', merge: '合并', toast: '下载中', rec: '加载中', concat: '合并中…' },
-        hi: { btn: 'डाउनलोड', merge: 'मर्ज', toast: 'डाउनलोड हो रहा है', rec: 'लोड', concat: 'मर्ज हो रहा है…' },
-        ar: { btn: 'تنزيل', merge: 'دمج', toast: 'جارٍ التنزيل', rec: 'جارٍ التحميل', concat: 'جارٍ الدمج…' },
-        ja: { btn: 'ダウンロード', merge: '結合', toast: 'ダウンロード中', rec: '読み込み中', concat: '結合中…' },
-        ko: { btn: '다운로드', merge: '병합', toast: '다운로드 중', rec: '불러오는 중', concat: '병합 중…' },
-        bn: { btn: 'ডাউনলোড', merge: 'মার্জ', toast: 'ডাউনলোড হচ্ছে', rec: 'লোড', concat: 'মার্জ হচ্ছে…' },
-        it: { btn: 'Scarica', merge: 'Unisci', toast: 'Scaricamento', rec: 'Caricamento', concat: 'Unione…' },
-        id: { btn: 'Unduh', merge: 'Gabungkan', toast: 'Mengunduh', rec: 'Memuat', concat: 'Menggabungkan…' }
+        en: { btn: 'Download', toast: 'Downloading' },
+        tr: { btn: 'İndir', toast: 'İndiriliyor' },
+        es: { btn: 'Descargar', toast: 'Descargando' },
+        fr: { btn: 'Télécharger', toast: 'Téléchargement' },
+        de: { btn: 'Herunterladen', toast: 'Wird heruntergeladen' },
+        pt: { btn: 'Baixar', toast: 'Baixando' },
+        ru: { btn: 'Скачать', toast: 'Скачивание' },
+        zh: { btn: '下载', toast: '下载中' },
+        hi: { btn: 'डाउनलोड', toast: 'डाउनलोड हो रहा है' },
+        ar: { btn: 'تنزيل', toast: 'جارٍ التنزيل' },
+        ja: { btn: 'ダウンロード', toast: 'ダウンロード中' },
+        ko: { btn: '다운로드', toast: '다운로드 중' },
+        bn: { btn: 'ডাউনলোড', toast: 'ডাউনলোড হচ্ছে' },
+        it: { btn: 'Scarica', toast: 'Scaricamento' },
+        id: { btn: 'Unduh', toast: 'Mengunduh' }
     };
 
     const getLang = () => {
@@ -283,74 +125,6 @@
             }
             .snap-dl-btn:disabled { opacity: 0.65; cursor: default; }
             .snap-container-relative { position: relative !important; }
-            .snap-dl-merge-panel {
-                position: fixed;
-                bottom: 70px;
-                right: 20px;
-                z-index: 2147483647;
-                background: rgba(10, 10, 10, 0.92);
-                color: #fffc00;
-                border: 1px solid rgba(255, 252, 0, 0.6);
-                border-radius: 8px;
-                padding: 10px;
-                font-size: 13px;
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-                backdrop-filter: blur(8px);
-                width: 220px;
-            }
-            .snap-dl-merge-header { font-weight: bold; margin-bottom: 6px; }
-            .snap-dl-merge-list {
-                max-height: 220px;
-                overflow-y: auto;
-                display: flex;
-                flex-direction: column;
-                gap: 4px;
-                margin-bottom: 8px;
-            }
-            .snap-dl-merge-item {
-                display: flex;
-                align-items: center;
-                gap: 6px;
-                color: #fff;
-                cursor: pointer;
-                padding: 3px;
-                border-radius: 4px;
-            }
-            .snap-dl-merge-item:hover { background: rgba(255, 255, 255, 0.08); }
-            .snap-dl-merge-thumb {
-                width: 40px;
-                height: 24px;
-                object-fit: cover;
-                border-radius: 3px;
-                background: #222;
-                flex: none;
-            }
-            .snap-dl-merge-thumb--empty { display: inline-block; }
-            .snap-dl-merge-label { font-size: 12px; flex: 1; }
-            .snap-dl-merge-remove {
-                background: none;
-                border: none;
-                color: rgba(255, 255, 255, 0.6);
-                cursor: pointer;
-                font-size: 14px;
-                line-height: 1;
-                padding: 2px 4px;
-            }
-            .snap-dl-merge-remove:hover { color: #fff; }
-            .snap-dl-merge-actions { display: flex; gap: 6px; }
-            .snap-dl-merge-actions button {
-                background: rgba(255, 255, 255, 0.1);
-                color: #fffc00;
-                border: 1px solid rgba(255, 252, 0, 0.6);
-                border-radius: 6px;
-                padding: 6px 10px;
-                font-size: 12px;
-                font-weight: bold;
-                cursor: pointer;
-            }
-            .snap-dl-merge-actions button:hover:not(:disabled) { background: rgba(255, 252, 0, 0.15); }
-            .snap-dl-merge-actions button:disabled { opacity: 0.65; cursor: default; }
-            .snap-dl-merge-actions [data-action="go"] { flex: 1; }
             .snap-dl-toast {
                 position: fixed;
                 bottom: 24px;
@@ -413,11 +187,10 @@
         return (heading && heading.textContent.trim()) || null;
     };
 
-    const buildFilename = (type, ext, meta, suffix) => {
+    const buildFilename = (type, ext, meta) => {
         const convName = getConversationName();
         const convPart = convName ? `${sanitizeFilenameSegment(convName)}_` : '';
-        const sfx = suffix ? `_${suffix}` : '';
-        return `snapchat_${convPart}${type}${sfx}_${formatDate((meta && meta.date) || new Date())}.${ext}`;
+        return `snapchat_${convPart}${type}_${formatDate((meta && meta.date) || new Date())}.${ext}`;
     };
 
     // ── Content-type → file type/extension mapping ────────────────────────────
@@ -441,10 +214,13 @@
     };
 
     // ── Download trigger ──────────────────────────────────────────────────────
-    // a.click() is required to trigger <a download> activation behavior in Firefox.
-    // dispatchEvent(new MouseEvent) does NOT reliably trigger downloads.
-    // A capture-phase handler on document stops the click from reaching Snapchat's
-    // SPA router (React bubble-phase listener on document) before it can navigate.
+    // a.click() is required to trigger <a download> activation behavior in
+    // Firefox and Chrome alike — this hands the blob straight to the browser's
+    // native download manager, byte-for-byte, no re-encode/conversion of any
+    // kind. dispatchEvent(new MouseEvent) does NOT reliably trigger downloads.
+    // A capture-phase handler on document stops the click from reaching
+    // Snapchat's SPA router (React bubble-phase listener on document) before
+    // it can navigate.
 
     const triggerDownload = (url, filename) => {
         const a = document.createElement('a');
@@ -459,9 +235,11 @@
         document.body.removeChild(a);
     };
 
-    // ── Single media download ─────────────────────────────────────────────────
+    // ── Media download ────────────────────────────────────────────────────────
     // Detects real Content-Type from blob URL headers so WebM video isn't saved
     // as .mp4 (wrong extension → decoder mismatch → audio only, black video).
+    // The blob itself is downloaded as-is — original resolution and codec,
+    // never transcoded.
 
     const downloadMedia = async (el) => {
         const src = el.currentSrc || el.src;
@@ -488,161 +266,6 @@
         showToast(filename, !!(meta && meta.date));
     };
 
-    // ── Floating merge panel ──────────────────────────────────────────────────
-    // Appears fixed bottom-right whenever 2+ video segments have been captured.
-    // Captured segments accumulate for as long as the user scrolls the chat —
-    // not just one split story — so the panel lists every one with a thumbnail
-    // and a checkbox: the user picks exactly which ones to merge instead of
-    // everything ever seen this session getting mashed together.
-
-    let _mergePanel = null;
-    let _mergeInProgress = false;
-    // injectButtons() calls updateMergePanel() on every DOM mutation Snapchat's
-    // SPA fires — including plain scrolling, unrelated to segments — so most
-    // calls have nothing new to show. Rebuilding innerHTML anyway would reset
-    // .snap-dl-merge-list's scrollTop to 0 on every one of those, making the
-    // list unscrollable. Skip the rebuild entirely when nothing changed.
-    let _lastPanelKey = '';
-
-    const readySegments = () => capturedSegments.filter(s => s.blob);
-
-    const updateMergePanel = () => {
-        if (_mergeInProgress) return;
-        const segments = readySegments();
-        const { merge: mergeText } = getLang();
-
-        if (segments.length < 2) {
-            if (_mergePanel) { _mergePanel.remove(); _mergePanel = null; }
-            _lastPanelKey = '';
-            return;
-        }
-
-        const panelKey = segments
-            .map(s => `${s.blobUrl}:${s.thumb ? 1 : 0}:${_selectedBlobUrls.has(s.blobUrl) ? 1 : 0}`)
-            .join('|');
-        if (_mergePanel && panelKey === _lastPanelKey) return;
-        _lastPanelKey = panelKey;
-
-        const existingList = _mergePanel && _mergePanel.querySelector('.snap-dl-merge-list');
-        const savedScrollTop = existingList ? existingList.scrollTop : 0;
-
-        if (!_mergePanel) {
-            _mergePanel = document.createElement('div');
-            _mergePanel.className = 'snap-dl-merge-panel';
-            document.body.appendChild(_mergePanel);
-        }
-
-        const selectedCount = segments.filter(s => _selectedBlobUrls.has(s.blobUrl)).length;
-        const updateCount = () => {
-            const el = _mergePanel.querySelector('[data-role="count"]');
-            if (el) el.textContent = segments.filter(s => _selectedBlobUrls.has(s.blobUrl)).length;
-        };
-
-        _mergePanel.innerHTML = `
-            <div class="snap-dl-merge-header">${mergeText} — <span data-role="count">${selectedCount}</span>/${segments.length}</div>
-            <div class="snap-dl-merge-list"></div>
-            <div class="snap-dl-merge-actions">
-                <button type="button" data-action="clear">✕</button>
-                <button type="button" data-action="go">⬇⬇ ${mergeText}</button>
-            </div>
-        `;
-
-        const list = _mergePanel.querySelector('.snap-dl-merge-list');
-        segments.forEach((seg, i) => {
-            const row = document.createElement('label');
-            row.className = 'snap-dl-merge-item';
-
-            const cb = document.createElement('input');
-            cb.type = 'checkbox';
-            cb.checked = _selectedBlobUrls.has(seg.blobUrl);
-            cb.onchange = () => {
-                if (cb.checked) _selectedBlobUrls.add(seg.blobUrl);
-                else _selectedBlobUrls.delete(seg.blobUrl);
-                updateCount();
-            };
-            row.appendChild(cb);
-
-            if (seg.thumb) {
-                const img = document.createElement('img');
-                img.src = seg.thumb;
-                img.className = 'snap-dl-merge-thumb';
-                row.appendChild(img);
-            } else {
-                const ph = document.createElement('span');
-                ph.className = 'snap-dl-merge-thumb snap-dl-merge-thumb--empty';
-                row.appendChild(ph);
-            }
-
-            const label = document.createElement('span');
-            label.className = 'snap-dl-merge-label';
-            label.textContent = `#${i + 1} · ${(seg.blob.size / 1e6).toFixed(1)}MB`;
-            row.appendChild(label);
-
-            const rm = document.createElement('button');
-            rm.type = 'button';
-            rm.className = 'snap-dl-merge-remove';
-            rm.textContent = '×';
-            rm.onclick = (e) => {
-                e.preventDefault();
-                _selectedBlobUrls.delete(seg.blobUrl);
-                const idx = capturedSegments.indexOf(seg);
-                if (idx >= 0) capturedSegments.splice(idx, 1);
-                updateMergePanel();
-            };
-            row.appendChild(rm);
-
-            list.appendChild(row);
-        });
-        list.scrollTop = savedScrollTop;
-
-        _mergePanel.querySelector('[data-action="clear"]').onclick = () => {
-            capturedSegments.length = 0;
-            _selectedBlobUrls.clear();
-            updateMergePanel();
-        };
-
-        _mergePanel.querySelector('[data-action="go"]').onclick = async () => {
-            const goBtn = _mergePanel.querySelector('[data-action="go"]');
-            const chosen = segments.filter(s => _selectedBlobUrls.has(s.blobUrl));
-            if (chosen.length < 2) {
-                showToast('Select at least 2 videos', true);
-                return;
-            }
-            goBtn.disabled = true;
-            _mergeInProgress = true;
-            try {
-                const blobs = chosen.map(s => s.blob);
-                const { concat: concatText } = getLang();
-                console.log('[SnapDL] Merging', blobs.length, 'segments');
-                const merged = await mergeVideoSegments(blobs, ({ done, total }) => {
-                    goBtn.textContent = `⏳ ${concatText} ${done}/${total}`;
-                });
-                console.log('[SnapDL] Merged blob:', merged.size, 'bytes, type:', merged.type);
-                const mergedCt = merged.type || (chosen[0].meta && chosen[0].meta.contentType) || 'video/webm';
-                const [, mergedExt] = CONTENT_TYPE_MAP[mergedCt.split(';')[0]] || ['video', 'webm'];
-                const filename = buildFilename('video', mergedExt, chosen[0].meta, 'merged');
-                const objectUrl = origCreateObjectURL(merged);
-                console.log('[SnapDL] Download URL:', objectUrl, '→', filename);
-                triggerDownload(objectUrl, filename);
-                setTimeout(() => origRevokeObjectURL(objectUrl), 30000);
-                showToast(filename, !!(chosen[0].meta && chosen[0].meta.date));
-                chosen.forEach(s => {
-                    _selectedBlobUrls.delete(s.blobUrl);
-                    const idx = capturedSegments.indexOf(s);
-                    if (idx >= 0) capturedSegments.splice(idx, 1);
-                });
-                _mergeInProgress = false;
-                updateMergePanel();
-            } catch (err) {
-                console.error('[SnapDL] Merge failed:', err);
-                showToast(`Merge failed: ${err.message || 'Error'}`, true);
-                _mergeInProgress = false;
-                goBtn.disabled = false;
-                goBtn.textContent = `⬇⬇ ${mergeText}`;
-            }
-        };
-    };
-
     // ── Button injection ──────────────────────────────────────────────────────
 
     const injectButtons = () => {
@@ -654,7 +277,6 @@
             if (el.dataset.snapDlReady) return;
 
             el.dataset.snapDlReady = 'true';
-            if (el instanceof HTMLVideoElement) captureVideoSegment(src);
             const container = el.parentElement;
             if (!container) return;
 
@@ -665,8 +287,6 @@
             btn.onclick = (e) => { e.preventDefault(); e.stopPropagation(); downloadMedia(el).catch(err => console.error('[SnapDL] Download failed:', err)); };
             container.appendChild(btn);
         });
-
-        updateMergePanel();
     };
 
     // ── Double-click shortcut ─────────────────────────────────────────────────
